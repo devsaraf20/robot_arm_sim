@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#0b0f17" />
-    <meta name="description" content="Browser-based 3-joint robot arm simulator with inverse kinematics, path recording and Python/Arduino export." />
-    <title>Robot Arm Simulator</title>
+    <meta name="description" content="Robot arm simulator and digital twin: inverse kinematics, path recording, Web Serial link to a real servo arm, Unreal Engine OSC control, Python/Arduino export." />
+    <title>Robot Arm Twin</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
@@ -14,11 +14,26 @@
     <canvas id="scene" aria-label="3D robot arm view"></canvas>
 
     <header class="hud">
-      <h1>Robot Arm <span>Sim</span></h1>
+      <h1>Robot Arm <span>Twin</span></h1>
       <div id="status" class="pill" data-status="ok">IK solved</div>
+      <div class="links" aria-label="Connections">
+        <span id="serialDot" class="link-dot" title="Real arm: not connected">ARM</span>
+        <span id="oscDot" class="link-dot" title="Unreal: not connected">UE</span>
+      </div>
     </header>
 
-    <p id="hint" class="hint">Drag the glowing ball · drag empty space to orbit · scroll / pinch to zoom</p>
+    <!-- Always visible. Escape key does the same. -->
+    <button id="estopBtn" class="estop" title="Emergency stop (Esc)" aria-label="Emergency stop">
+      <span>STOP</span>
+    </button>
+
+    <div id="estopBanner" class="estop-banner" role="alert" hidden>
+      <strong>Emergency stop</strong>
+      <span id="estopReason">All motion halted.</span>
+      <button id="resetBtn" class="btn small">Reset</button>
+    </div>
+
+    <p id="hint" class="hint">Drag the glowing ball · drag empty space to orbit · scroll / pinch to zoom · Esc = stop</p>
 
     <!-- Control panel: a side panel on desktop, a bottom sheet on phones. -->
     <aside id="panel" class="panel">
@@ -46,12 +61,57 @@
         </section>
 
         <section>
-          <div class="row-between">
-            <h2>Joints</h2>
-            <button id="homeBtn" class="btn ghost small">Home</button>
-          </div>
+          <h2>Joints</h2>
           <div id="joints" class="joints"><!-- sliders are created by main.js --></div>
         </section>
+
+        <section>
+          <h2>Safety</h2>
+          <div class="joint" style="--jc: #f59e0b">
+            <div class="joint-head">
+              <span class="joint-name">Max joint speed</span>
+              <span class="joint-val"><b id="speedVal">90°/s</b></span>
+            </div>
+            <input type="range" id="speedSlider" min="10" max="360" step="5" value="90" aria-label="Maximum joint speed in degrees per second" />
+          </div>
+          <div class="btn-row" style="margin-top: 10px">
+            <button id="homeBtn" class="btn" title="Move slowly to the home pose">⌂ Run homing</button>
+          </div>
+          <p class="small muted">Joint limits are always enforced. Speed limit applies to the simulator <em>and</em> the real arm; the firmware enforces it again.</p>
+        </section>
+
+        <details class="section" id="twinSection" open>
+          <summary><h2>Digital twin · real arm</h2></summary>
+          <p id="serialUnsupported" class="small warn" hidden>
+            Web Serial needs Chrome or Edge on a desktop computer, on https or localhost.
+          </p>
+          <div class="btn-row">
+            <button id="serialBtn" class="btn primary">Connect via USB</button>
+          </div>
+          <p class="small muted" id="serialStatus">Not connected. Upload <code>firmware/robot_arm_twin</code> to your Arduino first.</p>
+          <div class="sub">
+            <label class="small">Data direction</label>
+            <div class="segmented compact" id="twinMode">
+              <button data-twin="send" aria-pressed="true">Sim → Arm</button>
+              <button data-twin="read" aria-pressed="false">Arm → Sim</button>
+            </div>
+            <div class="row-between small">
+              <label class="check"><input type="checkbox" id="ghostChk" checked /> Show real arm ghost</label>
+              <button id="calBtn" class="btn ghost small" disabled title="Auto-calibrate feedback (moves the arm!)">Calibrate</button>
+            </div>
+          </div>
+          <pre id="serialLog" class="log" aria-label="Serial console"></pre>
+        </details>
+
+        <details class="section" id="oscSection">
+          <summary><h2>Unreal Engine · OSC</h2></summary>
+          <p class="small muted">Run <code>npm run bridge</code>, then connect. Unreal sends OSC to UDP 8000 and receives arm state on 8001. See <code>unreal/UNREAL.md</code>.</p>
+          <div class="btn-row">
+            <input id="oscUrl" class="text" value="ws://localhost:8080" aria-label="Bridge WebSocket URL" spellcheck="false" />
+            <button id="oscBtn" class="btn">Connect</button>
+          </div>
+          <p class="small muted" id="oscStatus">Not connected.</p>
+        </details>
 
         <section>
           <h2>Path recorder</h2>
@@ -65,6 +125,7 @@
             <span id="recInfo">No recording yet</span>
             <label class="check"><input type="checkbox" id="loopChk" /> Loop</label>
           </div>
+          <p class="small muted">Tip: in <b>Arm → Sim</b> mode, move the real arm by hand and record it, then switch to <b>Sim → Arm</b> and play it back.</p>
         </section>
 
         <section>

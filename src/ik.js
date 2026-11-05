@@ -37,14 +37,23 @@ export const ARM = {
 };
 
 /**
- * Joint limits in DEGREES. Every range is exactly 180° wide so it maps 1:1 onto a
- * standard hobby servo (0…180°). The exporters use `servo = angle − min`.
+ * Joint limits in DEGREES. The three arm joints each span exactly 180° so they map
+ * 1:1 onto a standard hobby servo (0…180°). Everything that talks to hardware
+ * (exporters, Web Serial link) uses the same rule:   servo = angle − min
+ *
+ * The 4th entry is the GRIPPER: not part of the IK chain (it only opens/closes the
+ * fingers), but it is a 4th servo on a real desktop arm, so it is recorded, exported
+ * and streamed like the others. 0° = closed, 90° = fully open.
  */
 export const JOINTS = [
   { name: 'Base', key: 'base', min: -90, max: 90, home: 0 },
   { name: 'Shoulder', key: 'shoulder', min: 0, max: 180, home: 70 },
   { name: 'Elbow', key: 'elbow', min: -150, max: 30, home: -100 },
+  { name: 'Gripper', key: 'gripper', min: 0, max: 90, home: 45 },
 ];
+
+/** How many joints take part in the IK chain (base, shoulder, elbow). */
+export const IK_JOINTS = 3;
 
 export const LIMITS = JOINTS.map((j) => [j.min * DEG, j.max * DEG]);
 export const HOME = JOINTS.map((j) => j.home * DEG);
@@ -150,6 +159,9 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
  *
  *  ── Step E: fallback when limits block every exact solution ───────────────
  *  See `refineWithinLimits` below (damped least squares).
+ *
+ *  Returns { q: [base, shoulder, elbow], error, status }: only the IK joints. The
+ *  caller keeps whatever gripper value it already had.
  */
 export function solveIK(target, current = HOME, arm = ARM) {
   const { L1, L2, BASE_HEIGHT } = arm;
@@ -171,7 +183,7 @@ export function solveIK(target, current = HOME, arm = ARM) {
   }
 
   // How "far" a pose is from the current one (sum of squared joint moves).
-  const effort = (q) => q.reduce((sum, v, i) => sum + wrapAngle(v - current[i]) ** 2, 0);
+  const effort = (q) => q.reduce((sum, v, i) => sum + wrapAngle(v - current[i]) ** 2, 0); // first 3 joints only
 
   let best = null;
   for (const q of candidates) {
@@ -192,7 +204,7 @@ export function solveIK(target, current = HOME, arm = ARM) {
   // No exact in-limit solution: start the numerical solver from every candidate
   // (clamped into limits) plus the current pose, and keep the best result.
   let refined = null;
-  for (const seed of [...candidates, current]) {
+  for (const seed of [...candidates, current.slice(0, IK_JOINTS)]) {
     const q = refineWithinLimits(clampToLimits(seed), target, arm);
     const err = dist(forwardKinematics(q, arm).tip, target);
     if (!refined || err < refined.err - 1e-4 || (Math.abs(err - refined.err) <= 1e-4 && effort(q) < effort(refined.q))) {
@@ -300,3 +312,10 @@ function solve3(A, b) {
 
 export const toDeg = (q) => q.map((v) => v / DEG);
 export const toRad = (d) => d.map((v) => v * DEG);
+
+/* ── Hardware angle conversion ──────────────────────────────────────────────
+ *  The browser and the Arduino agree on "logical servo degrees" (0…180) for every
+ *  joint: servo = simulatorAngle − jointMin. Hardware quirks (a servo mounted
+ *  backwards, a few degrees of trim) are handled in the firmware, not here.     */
+export const simToServo = (qRad) => qRad.map((v, i) => v / DEG - JOINTS[i].min);
+export const servoToSim = (servoDeg) => servoDeg.map((v, i) => clamp((v + JOINTS[i].min) * DEG, LIMITS[i][0], LIMITS[i][1]));

@@ -17,22 +17,37 @@
 import * as THREE from 'three';
 import { ARM } from './ik.js';
 
-export const JOINT_COLORS = ['#2dd4bf', '#fb923c', '#a78bfa']; // base, shoulder, elbow
+export const JOINT_COLORS = ['#2dd4bf', '#fb923c', '#a78bfa', '#f472b6']; // base, shoulder, elbow, gripper
 
-export function createArm() {
+/**
+ * @param {object}  opts
+ * @param {boolean} opts.ghost  build a see-through "ghost" copy. The digital twin uses
+ *                              it to show where the REAL arm reports it is, overlaid
+ *                              on the simulated one (like an onion-skin in animation).
+ */
+export function createArm({ ghost = false } = {}) {
   const root = new THREE.Group();
 
   // Materials: "PBR" like Blender's Principled BSDF — colour + metalness + roughness.
-  const body = new THREE.MeshStandardMaterial({ color: 0xe8eaf0, metalness: 0.15, roughness: 0.45 });
-  const dark = new THREE.MeshStandardMaterial({ color: 0x2a2f3a, metalness: 0.6, roughness: 0.35 });
-  const accent = JOINT_COLORS.map(
-    (c) => new THREE.MeshStandardMaterial({ color: c, metalness: 0.2, roughness: 0.4, emissive: c, emissiveIntensity: 0.15 })
-  );
+  let body, dark, accent;
+  if (ghost) {
+    // One flat, unlit, transparent material for everything. depthWrite: false stops the
+    // ghost from hiding parts of itself or the real model behind it.
+    const g = new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.22, depthWrite: false });
+    body = dark = g;
+    accent = JOINT_COLORS.map(() => g);
+  } else {
+    body = new THREE.MeshStandardMaterial({ color: 0xe8eaf0, metalness: 0.15, roughness: 0.45 });
+    dark = new THREE.MeshStandardMaterial({ color: 0x2a2f3a, metalness: 0.6, roughness: 0.35 });
+    accent = JOINT_COLORS.map(
+      (c) => new THREE.MeshStandardMaterial({ color: c, metalness: 0.2, roughness: 0.4, emissive: c, emissiveIntensity: 0.15 })
+    );
+  }
 
   const mesh = (geo, mat) => {
     const m = new THREE.Mesh(geo, mat);
-    m.castShadow = true;
-    m.receiveShadow = true;
+    m.castShadow = !ghost;
+    m.receiveShadow = !ghost;
     return m;
   };
 
@@ -96,23 +111,31 @@ export function createArm() {
 
   const wrist = hinge(0.15, 0.34, dark);
   tip.add(wrist);
-  for (const side of [-1, 1]) {
-    const finger = mesh(new THREE.BoxGeometry(0.28, 0.06, 0.06), dark);
-    finger.position.set(0.16, 0, side * 0.1);
+  // Two fingers that slide apart as the gripper (4th servo) opens.
+  const fingers = [-1, 1].map((side) => {
+    const finger = mesh(new THREE.BoxGeometry(0.3, 0.07, 0.05), accent[3] ?? dark);
+    finger.position.set(0.17, 0, side * 0.1);
+    finger.userData.side = side;
     tip.add(finger);
-  }
+    return finger;
+  });
 
   const joints = [baseYaw, shoulder, elbow];
 
-  /** Apply joint angles (radians) to the model. */
+  /** Apply joint angles (radians) to the model: [base, shoulder, elbow, gripper]. */
   function setAngles(q) {
     baseYaw.rotation.y = q[0];
     shoulder.rotation.z = q[1];
     elbow.rotation.z = q[2];
+    if (q.length > 3) {
+      const open = q[3] / (Math.PI / 2); // 0 = closed … 1 = open (90°)
+      for (const f of fingers) f.position.z = f.userData.side * (0.035 + open * 0.13);
+    }
   }
 
   /** Highlight a joint (used when hovering its slider). */
   function highlight(index) {
+    if (ghost) return;
     accent.forEach((m, i) => (m.emissiveIntensity = i === index ? 0.7 : 0.15));
   }
 

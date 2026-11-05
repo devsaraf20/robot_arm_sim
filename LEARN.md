@@ -14,12 +14,21 @@ robot_arm_sim/
 ├── src/
 │   ├── main.js         ← the "Level Blueprint": wires everything together, runs every frame
 │   ├── ik.js           ← pure math: forward + inverse kinematics, joint limits
-│   ├── arm.js          ← builds the 3D robot out of boxes and cylinders (the "rig")
+│   ├── arm.js          ← builds the 3D robot out of boxes and cylinders (the "rig") + its ghost
 │   ├── shaders.js      ← two hand-written GPU shaders (grid floor, glowing target)
 │   ├── recorder.js     ← records joint angles over time and plays them back (a timeline)
 │   ├── exporters.js    ← turns a recording into a Python script and an Arduino sketch
+│   ├── safety.js       ← speed limit, emergency stop, homing (the rules everyone must obey)
+│   ├── protocol.js     ← the text "language" the browser and the Arduino speak
+│   ├── serial.js       ← live USB connection to the real arm (Web Serial)
+│   ├── unreal-link.js  ← receives Unreal's OSC messages (via the bridge) + coordinate conversion
 │   └── styles.css      ← how the UI looks (colours, spacing, phone layout)
-├── tests/ik.test.mjs   ← automatic checks that the IK math is right
+├── firmware/robot_arm_twin/robot_arm_twin.ino  ← the program that runs ON the Arduino
+├── bridge/             ← small Node.js program: Unreal (OSC/UDP) ⇄ browser (WebSocket)
+├── unreal/             ← Unreal Engine guide + C++ component
+├── tools/osc_test_sender.py  ← pretends to be Unreal, for testing
+├── docs/HARDWARE.md    ← parts list, wiring, calibration for the real arm
+├── tests/              ← automatic checks (IK math, safety, protocol, OSC)
 ├── package.json        ← the project's "shopping list" of libraries + commands
 ├── vite.config.js      ← settings for Vite, the dev server / bundler
 └── vercel.json         ← tells Vercel how to build and host the site
@@ -76,7 +85,8 @@ button.addEventListener('click', () => { ... });  // "On Clicked" event → run 
 **FK is what Blender does when you rotate bones in Pose Mode.** You set each joint's angle and the
 hand ends up *somewhere*. The question FK answers: *where?*
 
-Our arm has three joints:
+Our arm has three joints that position the hand (plus a gripper that only opens and closes, so
+it doesn't take part in the kinematics):
 
 | Joint | Turns around | Means |
 |---|---|---|
@@ -174,8 +184,11 @@ hits its stop stays there while the others keep trying. The status pill turns am
 ### `src/ik.js` — the brain (pure math)
 
 - `ARM` holds the bone lengths. Change them and the model and solver both update.
-- `JOINTS` holds each joint's name, limits (in degrees) and home pose. Every range is exactly 180°
-  wide so it maps onto a hobby servo's 0–180°.
+- `JOINTS` holds each joint's name, limits (in degrees) and home pose: base, shoulder, elbow and
+  gripper. The three arm joints each span exactly 180° so they map onto a hobby servo's 0–180°.
+  `IK_JOINTS = 3` says only the first three take part in IK.
+- `simToServo` / `servoToSim` convert between simulator angles and "servo degrees"
+  (`servo = angle − min`). The exporters, the USB link and the firmware all use this one rule.
 - `forwardKinematics(q)` — section 2 above.
 - `solveIK(target, current)` — section 3 above. Returns `{ q, error, status }`.
 - `refineWithinLimits(...)` — the "nudge and check" fallback.
@@ -200,6 +213,10 @@ Builds the robot from primitives, like blocking out a model in Blender:
 - The hierarchy `baseYaw → shoulder → elbow → tip` is the bone chain. `setAngles(q)` just sets
   three rotations; parenting does the rest.
 - `castShadow` / `receiveShadow` = the shadow toggles in an object's render settings.
+- The gripper fingers slide apart as the 4th angle (`q[3]`) grows. They are moved by code, like a
+  driver in Blender.
+- `createArm({ ghost: true })` builds the same rig with one see-through, unlit material
+  (`MeshBasicMaterial`, `opacity: 0.22`, `depthWrite: false`): an onion-skin of the real arm.
 
 ### `src/shaders.js` — writing materials as code
 
@@ -249,16 +266,19 @@ Read it top to bottom; the sections are numbered.
    orbit/zoom/pan like the viewport navigation. Lights: a `HemisphereLight` (sky/ground fill, like
    a world colour), a `DirectionalLight` "sun" that casts shadows, and a blue rim light. ACES tone
    mapping is the filmic look curve.
-2. **The arm, target and helper lines.** The target is a glowing sphere plus a *bigger invisible
-   sphere* that's easy to hit with a finger. Thin lines give depth cues: one drops to the floor,
-   one shows the gap when the arm can't reach, one draws the recorded path.
+2. **The arm, its ghost, the target and helper lines.** The target is a glowing sphere plus a *bigger
+   invisible sphere* that's easy to hit with a finger. Thin lines give depth cues: one drops to the
+   floor, one shows the gap when the arm can't reach, one draws the recorded path. The **ghost** is
+   a second, see-through copy of the arm that shows where the *real* arm says it is.
 3. **App state.** One small object holds everything that changes: the mode, the angles shown
-   right now (`q`) and the angles the arm is heading to (`goal`).
-4. **Joint sliders** are created by code from the `JOINTS` list, so adding a joint adds a slider.
-   Each shows the simulator angle and the matching servo angle. Moving a slider switches to
-   sliders mode.
-5. **Mode switch / drag plane / Home** — simple click handlers.
-6. **Dragging in 3D — raycasting.** The mouse is 2D, the target is 3D. We:
+   right now (`q`) and the angles the arm is heading to (`goal`), plus what the real arm last reported.
+4. **Safety.** Wires the STOP button, the Esc key, Reset, homing and the speed slider to `safety.js`.
+   `canDrive()` answers "may anyone move the arm right now?" and every input checks it first.
+5. **Joint sliders** are created by code from the `JOINTS` list, so adding a joint adds a slider.
+   Each shows the simulator angle and the matching servo angle. Moving an arm slider switches to
+   sliders mode; the gripper slider works in both modes.
+6. **Mode switch / drag plane** — simple click handlers.
+7. **Dragging in 3D — raycasting.** The mouse is 2D, the target is 3D. We:
    1. shoot a **ray** from the camera through the pointer (like a Line Trace by Channel in Unreal),
    2. hit an invisible **plane** through the target,
    3. move the target to where the ray hits.
@@ -266,18 +286,23 @@ Read it top to bottom; the sections are numbered.
    The plane you choose decides the motion: *Free* faces the camera, *Horizontal* is parallel to the
    floor, *Height* only moves up/down. We listen with `capture: true` so we hear the click *before*
    the orbit controls do — that's how grabbing the ball doesn't also spin the camera.
-7. **Recorder UI** — buttons call the recorder and refresh labels.
-8. **Export dialog** — generates the code text, shows it, copies it, or downloads it as a file
-   (a `Blob` is a file made in memory).
-9. **Layout.** On a phone the panel covers the bottom half, on desktop the right side.
-   `camera.setViewOffset` shifts the rendered picture so the arm sits in the *visible* part —
-   like a camera's *Shift X/Y* lens setting in Blender.
-10. **The animation loop.** `requestAnimationFrame(tick)` asks the browser to call `tick` before
+8. **Digital twin** — the USB connection to the real arm (section 5 below explains it).
+9. **Unreal Engine** — reacting to OSC messages from Unreal (section 5 below).
+10. **Recorder UI** — buttons call the recorder and refresh labels.
+11. **Export dialog** — generates the code text, shows it, copies it, or downloads it as a file
+    (a `Blob` is a file made in memory).
+12. **Layout.** On a phone the panel covers the bottom half, on desktop the right side.
+    `camera.setViewOffset` shifts the rendered picture so the arm sits in the *visible* part —
+    like a camera's *Shift X/Y* lens setting in Blender.
+13. **The animation loop.** `requestAnimationFrame(tick)` asks the browser to call `tick` before
     the next screen refresh — this is **Event Tick**. Each tick:
-    - plays back a recording, **or** eases the joints towards `goal` (exponential smoothing — each
-      frame covers a fixed fraction of the remaining distance, which looks like a servo settling),
+    - picks **who drives the arm** this frame, in priority order: e-stop → homing → real arm (read
+      mode) → recording playback → you / Unreal,
+    - moves the joints towards `goal` with `stepTowards` — a gentle ease *and* a hard speed cap,
     - records the pose if recording,
+    - streams the pose to the real arm and shows the ghost,
     - updates the model, sliders, status pill, shader time, and helper lines,
+    - sends the arm's state to Unreal,
     - renders the frame.
 
     `dt` (delta time, seconds since the last frame) keeps motion speed the same on 30 Hz and
@@ -285,8 +310,8 @@ Read it top to bottom; the sections are numbered.
 
 ### `src/recorder.js` — a tiny timeline
 
-- A recording is a list of **keyframes** `{ t: seconds, q: [base, shoulder, elbow] }`, captured up
-  to 30 times per second.
+- A recording is a list of **keyframes** `{ t: seconds, q: [base, shoulder, elbow, gripper] }`,
+  captured up to 30 times per second.
 - **Playback** finds the two keyframes around the current time and blends them — *linear
   interpolation*, the "Linear" interpolation mode in Blender's Graph Editor. A *binary search*
   finds the right pair quickly (like opening a dictionary in the middle instead of reading from A).
@@ -299,10 +324,10 @@ Read it top to bottom; the sections are numbered.
 Both exporters take the same thing: rows of joint angles in degrees, `stepMs` apart. They build
 the program as text (JavaScript template strings, ``` `like ${this}` ```).
 
-**Simulator angle → servo angle.** Every joint's range is 180° wide, so:
+**Simulator angle → servo angle.** Every arm joint's range is 180° wide (the gripper uses 0–90°), so:
 
 ```
-servo = simulatorAngle − jointMinimum        (always 0…180)
+servo = simulatorAngle − jointMinimum        (always within 0…180)
 servo = 180 − servo   if the servo is mounted backwards (INVERT)
 servo = servo + TRIM                          (small calibration offset)
 ```
@@ -315,8 +340,8 @@ The generated files keep the raw simulator angles and do this conversion themsel
 - `python3 robot_arm_motion.py` — dry run, prints the servo angles.
 - `--plot` — graphs the motion (needs `matplotlib`).
 - `--backend servokit` — Raspberry Pi + PCA9685 servo board (`pip install adafruit-circuitpython-servokit`).
-- `--backend serial --port /dev/ttyUSB0` — streams angles over USB to an Arduino running the exported
-  sketch with `STREAM_MODE 1` (`pip install pyserial`).
+- `--backend serial --port /dev/ttyUSB0` — streams angles over USB to an Arduino running the
+  digital-twin firmware (`pip install pyserial`). The firmware still applies its own safety limits.
 - Timing uses a schedule (`start + i·dt`) instead of plain sleeps, so small delays don't add up.
 
 **Arduino sketch** (`robot_arm_motion.ino`)
@@ -327,7 +352,8 @@ The generated files keep the raw simulator angles and do this conversion themsel
 - `writeMicroseconds` sends a precise pulse (500–2500 µs ≈ 0–180°) for smoother motion than whole
   degrees. Many servos prefer 1000–2000 µs; adjust `PULSE_MIN_US`/`PULSE_MAX_US`.
 - `loop()` uses `millis()` timing instead of `delay()` so frames stay evenly spaced.
-- `STREAM_MODE 1` turns it into a receiver for the Python script.
+- It's a *standalone* player: once uploaded, the arm replays the motion without a computer. A button
+  on D2 pauses it. Pins match `docs/HARDWARE.md`. For live control use the twin firmware instead.
 
 ### `src/styles.css` — the look
 
@@ -347,33 +373,117 @@ Plain HTML elements: a `<canvas>` (where Three.js draws), a header with the stat
 JavaScript can find them (`document.getElementById('recBtn')` — like getting a widget reference by
 name). The last line loads `src/main.js`, which starts everything.
 
-### `tests/ik.test.mjs` — automatic checks
+### `tests/` — automatic checks
 
-Picks 500 random legal poses, computes where the tip would be (FK), asks IK to find angles for that
-point, and checks the tip lands within 1 mm. It also checks the out-of-reach, behind-the-robot and
-joint-limit cases. Run `npm test` after changing any math.
+`ik.test.mjs` picks 500 random legal poses, computes where the tip would be (FK), asks IK to find
+angles for that point, and checks the tip lands within 1 mm. It also checks the out-of-reach,
+behind-the-robot and joint-limit cases. `twin.test.mjs` checks the speed limit, the e-stop latch,
+the serial protocol parser, the OSC encoder/decoder and the Unreal coordinate conversion.
+Run `npm test` after changing any of them.
 
 ---
 
-## 5. Driving a real arm — checklist
+## 5. The digital twin — connecting to a real arm and to Unreal
+
+A **digital twin** is a virtual copy that stays in sync with a physical thing. Here, data flows both
+ways: the browser can drive the real arm, and the real arm can drive the browser.
+
+```
+ Unreal ──OSC──▶ bridge ──WebSocket──▶ BROWSER (IK, safety, recorder) ──USB serial──▶ Arduino ──▶ servos
+ Unreal ◀─────── bridge ◀───────────── BROWSER ◀───── position reports ───────────── Arduino ◀── sensors
+```
+
+### Talking over USB: `serial.js` + `protocol.js`
+
+- **Web Serial** is a browser feature that lets a page talk to a USB device after you pick it from a
+  list (for privacy, a page can never grab a device by itself). It works in Chrome and Edge on
+  desktop, on `https://` or `localhost` pages.
+- The data arrives through **streams**, which are pipes: bytes come in → a `TextDecoderStream`
+  turns them into text → we cut the text into lines. Data comes in random-sized chunks, a bit like
+  packets arriving out of order in multiplayer, so `createLineSplitter` keeps the unfinished end
+  of a chunk until the rest arrives.
+- The **protocol** is deliberately plain text, one command per line: `T 90.0 70.0 50.0 45.0` means
+  "go to these servo angles", `E` is emergency stop, and the arm replies `P …` with its position
+  about 25 times a second. Plain text means you can debug by typing into the Arduino Serial Monitor.
+- `sendTarget` is **throttled** to 30 messages per second and only sends when something changed,
+  plus a "keepalive" every 250 ms. An Arduino Uno's input buffer is only 64 bytes, so flooding it
+  makes motion stutter, like a network-saturated multiplayer game.
+
+**The two directions:**
+
+- **Sim → Arm**: every frame, `main.js` converts the shown angles with `simToServo` and streams them.
+  The **ghost** shows the arm's *reported* position, so lag or a stalled joint is visible at a glance.
+- **Arm → Sim** (read mode): the firmware lets the servos go limp and reports what its sensors
+  measure. The sim's `goal` becomes that pose. Recording still works, so you can **teach by
+  demonstration**: move the real arm by hand, record, then play it back. It's the robotics
+  version of motion capture.
+
+### Safety: `safety.js` and the firmware
+
+Think of it as layers, like collision channels and blocking volumes all applying at once:
+
+1. **Joint limits** — every angle is clamped into its legal range, in the browser *and* in the
+   firmware (`SAFE_MIN`/`SAFE_MAX`).
+2. **Max speed** — `stepTowards` first eases towards the goal (natural motion), then **caps** how far
+   each joint may turn this frame: `maxSpeed × dt`. However fast you drag, or however wild an Unreal
+   animation gets, the joints can't exceed it. The firmware applies its own cap too.
+3. **Homing** — a slow (30°/s), predictable move back to a known pose. The firmware also homes on
+   power-up, starting from the real measured position when it has sensors so nothing jumps.
+4. **Emergency stop** — STOP button, Esc key, the button on the arm, or `/arm/estop` from Unreal.
+   It's **latched** (it stays on) until a *person* clicks Reset in the browser. Remote systems may
+   stop the arm but never restart it. That's a common rule in real industrial robotics.
+5. **Watchdog** — if the browser crashes or the cable is pulled mid-move, the firmware hears nothing
+   for 1 s and holds still instead of carrying on.
+
+`safety.js` is a tiny **state machine**: `normal`, `homing` or `estop`, with rules for moving
+between them. You've built these before as animation state machines in Unreal or Blender drivers.
+
+### The firmware: `firmware/robot_arm_twin/robot_arm_twin.ino`
+
+Arduino code is C++. Every sketch has `setup()` (runs once, like *BeginPlay*) and `loop()` (runs
+forever, like *Tick*). Ours never uses long `delay()`s in the loop. Instead it checks `millis()`
+(time since boot) and does a little work every 20 ms, so it can always hear an `E` instantly.
+Calibration values are stored in **EEPROM**, a tiny memory that survives power-off (a save game).
+
+### Unreal: `bridge/`, `unreal-link.js`, `unreal/`
+
+- **OSC** (Open Sound Control) is a simple message format used by Unreal, TouchDesigner, lighting desks,
+  etc. A message is an address like `/arm/target` plus some numbers. `bridge/osc.mjs` encodes and
+  decodes it by hand: text padded to 4 bytes, then big-endian floats.
+- Browsers can't receive OSC (it uses UDP, which pages aren't allowed to open), so
+  `bridge/osc-bridge.mjs` relays it to the page over a **WebSocket**, a long-lived two-way
+  connection. It only accepts pages from your own computer, so a random website can't move your robot.
+- **Coordinate conversion** is the classic gotcha: Unreal is Z-up, left-handed, in cm; Three.js is
+  Y-up, right-handed. `unrealToSim` swaps Y and Z (which also flips handedness) and scales cm to sim units.
+- `unreal/UNREAL.md` shows both a Blueprint-only setup and a C++ component that makes any actor, or a
+  character's hand socket, drive the arm.
+
+---
+
+## 6. Driving a real arm — checklist
+
+The full guide, with a parts list, wiring diagram and calibration, is **`docs/HARDWARE.md`**. Short version:
 
 1. Build an arm whose proportions match `ARM` in `ik.js` (or change `ARM` to match yours — the
    simulator and exports follow).
-2. Mount each servo so that **servo 90°** matches the simulator pose: base facing forward,
-   shoulder pointing straight up (90°), elbow bent −60°. (The slider labels show the servo angle
-   for every pose — use that to check.)
+2. Mount each servo so that **servo 90°** matches this pose: base facing forward, upper arm pointing
+   straight up, forearm pointing forward 30° above horizontal (elbow −60°), gripper half open.
+   The slider labels show the servo angle for every pose, so use them to check.
 3. If a joint moves the wrong way, set its `INVERT` to true. If it's a few degrees off, use `TRIM`.
 4. **Power servos from a separate 5–6 V supply** and connect its ground to the Arduino's ground.
-   Three servos can draw more current than USB provides.
-5. First test with slow, small motions and keep a hand near the power switch.
+   Four servos can draw far more current than USB provides.
+5. Tighten `SAFE_MIN`/`SAFE_MAX` in the firmware so the arm can't hit the table.
+6. First test with a low speed limit and keep a hand near the STOP button and the power switch.
 
 ---
 
-## 6. Things to try next
+## 7. Things to try next
 
 - Change `ARM.L1` / `ARM.L2` or a joint's `min`/`max` in `ik.js` and watch the solver adapt.
-- Add a 4th joint (a wrist pitch). FK gets one more arrow; IK can keep the wrist at a fixed angle
+- Add a wrist pitch joint. FK gets one more arrow; IK can keep the wrist at a fixed angle
   relative to the ground and solve the rest exactly as now.
 - In `shaders.js`, change the grid spacing or make the reach ring pulse with `uTime`.
 - Replace the box geometry in `arm.js` with a model from Blender exported as `.glb`
   (`GLTFLoader` in Three.js) — keep the same parent/child pivot structure.
+- In Unreal, attach the driver component to a VR motion controller and puppeteer the arm with your hand.
+- Add a "collision box" to `safety.js` that rejects targets inside a no-go zone (e.g. a cup on the desk).

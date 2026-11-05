@@ -67,6 +67,10 @@ html, body {
 .pill[data-status='manual'] { --c: var(--accent); }
 .pill[data-status='playing'] { --c: #a78bfa; }
 .pill[data-status='recording'] { --c: var(--bad); }
+.pill[data-status='estop'] { --c: var(--bad); }
+.pill[data-status='homing'] { --c: var(--warn); }
+.pill[data-status='reading'] { --c: #38bdf8; }
+.pill[data-status='unreal'] { --c: #f472b6; }
 
 .hint {
   position: fixed;
@@ -243,6 +247,104 @@ select {
   white-space: pre;
 }
 
+
+/* ─── Connection indicators ────────────────────────────────────────────────── */
+.links { display: flex; gap: 6px; }
+.link-dot {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 3px 7px;
+  border-radius: 6px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--panel-border);
+}
+.link-dot.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+.link-dot.busy { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+
+/* ─── Emergency stop ───────────────────────────────────────────────────────── */
+.estop {
+  position: fixed;
+  top: calc(var(--gutter) + env(safe-area-inset-top));
+  right: calc(320px + 2 * var(--gutter) + 12px); /* just left of the side panel */
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  border: 4px solid #fde047; /* yellow ring, like a real e-stop */
+  background: radial-gradient(circle at 35% 30%, #f87171, #b91c1c 70%);
+  color: #fff;
+  font: 800 14px/1 Inter, system-ui, sans-serif;
+  letter-spacing: 0.06em;
+  box-shadow: 0 6px 20px rgba(185, 28, 28, 0.5), inset 0 -4px 0 rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  z-index: 20;
+  touch-action: manipulation;
+}
+.estop:active { transform: translateY(2px); box-shadow: 0 2px 8px rgba(185, 28, 28, 0.5); }
+.estop.active { animation: estopPulse 1s infinite; }
+@keyframes estopPulse { 50% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0.25); } }
+
+.estop-banner {
+  position: fixed;
+  top: calc(var(--gutter) + 52px + env(safe-area-inset-top));
+  left: var(--gutter);
+  z-index: 19;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  max-width: min(520px, calc(100vw - 2 * var(--gutter) - 90px));
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(127, 29, 29, 0.92);
+  border: 1px solid var(--bad);
+  font-size: 13px;
+}
+.estop-banner[hidden] { display: none; }
+.estop-banner .btn { flex: 0 0 auto; background: #fff; color: #7f1d1d; }
+
+/* ─── Collapsible sections, console, inputs ────────────────────────────────── */
+details.section { padding: 14px 0; border-bottom: 1px solid var(--panel-border); }
+details.section > summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; }
+details.section > summary::-webkit-details-marker { display: none; }
+details.section > summary::after { content: '▸'; color: var(--muted); transition: transform 0.15s; }
+details.section[open] > summary::after { transform: rotate(90deg); }
+details.section > summary h2 { margin: 0; }
+details.section[open] > summary { margin-bottom: 10px; }
+details.section .btn-row + p, details.section p { margin: 8px 0; }
+
+.log {
+  margin: 10px 0 0;
+  height: 96px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 8px;
+  background: #070a10;
+  border: 1px solid var(--panel-border);
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #94a3b8;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log:empty::before { content: 'Serial console…'; opacity: 0.5; }
+
+input.text {
+  flex: 2;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  background: var(--field);
+  color: var(--text);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+code { font: 0.92em ui-monospace, SFMono-Regular, Menlo, monospace; color: #cbd5e1; }
+.warn { color: var(--warn); }
+input[type='range']:disabled { opacity: 0.45; cursor: not-allowed; }
+.segmented button:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /* ─── Phones: panel becomes a bottom sheet ─────────────────────────────────── */
 @media (max-width: 720px) {
   .hud h1 { font-size: 16px; }
@@ -276,4 +378,7 @@ select {
   .panel-handle .grip { width: 40px; height: 4px; border-radius: 4px; background: rgba(255, 255, 255, 0.25); }
   .panel-body { padding: 0 var(--gutter) var(--gutter); }
   .panel.collapsed .panel-body { display: none; }
+  .hud { flex-wrap: wrap; row-gap: 6px; max-width: calc(100vw - 110px); }
+  .estop { right: calc(var(--gutter) + env(safe-area-inset-right)); width: 64px; height: 64px; font-size: 13px; }
+  .estop-banner { top: calc(var(--gutter) + 84px + env(safe-area-inset-top)); }
 }

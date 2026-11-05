@@ -1,15 +1,30 @@
 /**
  * main.js — the "level blueprint" of the app.
- * It sets up the 3D scene, connects the UI buttons/sliders to the arm, handles
- * dragging the target, and runs the animation loop that redraws every frame.
+ * It sets up the 3D scene, connects the UI to the arm, handles dragging the target,
+ * talks to the real arm (Web Serial) and Unreal (OSC bridge), applies the safety
+ * rules, and runs the animation loop that redraws every frame.
+ *
+ * WHO DRIVES THE ARM? Several things can want to move it. Every frame we pick ONE,
+ * in this priority order (highest first):
+ *   1. Emergency stop   – nothing moves
+ *   2. Homing           – slow move to HOME
+ *   3. Real arm (read)  – the 3D model mirrors the physical arm
+ *   4. Recording playback
+ *   5. You / Unreal     – dragging the target, the sliders, or OSC messages
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { ARM, JOINTS, LIMITS, HOME, solveIK, forwardKinematics, clamp, toDeg } from './ik.js';
+import {
+  ARM, JOINTS, LIMITS, HOME, IK_JOINTS, solveIK, forwardKinematics, clamp, toDeg, simToServo, servoToSim,
+} from './ik.js';
 import { createArm, JOINT_COLORS } from './arm.js';
 import { createGridMaterial, createGlowMaterial } from './shaders.js';
 import { createRecorder } from './recorder.js';
 import { toPython, toArduino } from './exporters.js';
+import { createSafety, stepTowards, SPEED_RANGE } from './safety.js';
+import { createSerialLink, serialSupported } from './serial.js';
+import { cmd } from './protocol.js';
+import { createUnrealLink, unrealToSim, simToUnreal } from './unreal-link.js';
 
 const $ = (id) => document.getElementById(id);
 const DEG = Math.PI / 180;
@@ -62,10 +77,15 @@ grid.position.y = 0.001; // a hair above the shadow floor to avoid flicker (z-fi
 scene.add(grid);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  2. THE ARM, THE TARGET, AND HELPER LINES
+ *  2. THE ARM, ITS GHOST, THE TARGET, AND HELPER LINES
  * ═══════════════════════════════════════════════════════════════════════════ */
 const arm = createArm();
 scene.add(arm.root);
+
+// The "ghost" shows where the REAL arm says it is (digital twin), on top of the sim.
+const ghost = createArm({ ghost: true });
+ghost.root.visible = false;
+scene.add(ghost.root);
 
 const STATUS_COLORS = { ok: '#22c55e', 'joint-limit': '#f59e0b', 'out-of-reach': '#ef4444' };
 
@@ -118,9 +138,16 @@ function setLine(line, points) {
 const state = {
   mode: 'ik', // 'ik' = drag the target, 'sliders' = drive joints directly
   dragPlane: 'view', // 'view' | 'floor' | 'height'
-  q: HOME.slice(), // angles currently SHOWN (radians)
+  q: HOME.slice(), // angles currently SHOWN (radians): base, shoulder, elbow, gripper
   goal: HOME.slice(), // angles the arm is moving TOWARDS
   ik: { status: 'ok', error: 0 },
+  twin: {
+    mode: 'send', // 'send' = sim drives the real arm, 'read' = real arm drives the sim
+    measured: null, // last pose reported by the real arm (radians)
+    measuredAt: 0,
+    firmware: null, // { firmware, version, joints, feedback } from the HELLO line
+    deviceState: '',
+  },
 };
 const recorder = createRecorder();
 
@@ -132,15 +159,89 @@ function vec(p) {
   return new THREE.Vector3(p.x, p.y, p.z);
 }
 
-/** Run the IK solver for the current target position. */
+/** Keep a target inside a sensible box: above the floor and not miles away. */
+function clampTarget(p) {
+  p.y = clamp(p.y, 0.05, 4.5);
+  const horiz = Math.hypot(p.x, p.z);
+  if (horiz > 4) { p.x *= 4 / horiz; p.z *= 4 / horiz; }
+  return p;
+}
+
+/** Run the IK solver for the current target position (keeps the gripper as it is). */
 function solveForTarget() {
   const res = solveIK(target.position, state.goal);
-  state.goal = res.q;
+  state.goal = [...res.q, ...state.goal.slice(IK_JOINTS)];
   state.ik = res;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  4. UI: JOINT SLIDERS
+ *  4. SAFETY (see safety.js) — e-stop, homing, speed limit
+ * ═══════════════════════════════════════════════════════════════════════════ */
+const safety = createSafety({
+  onChange(s, reason) {
+    if (s === 'estop') {
+      state.goal = state.q.slice(); // freeze exactly where we are
+      stopPlayback();
+      if (recorder.state === 'recording') recorder.stop();
+      serial.send(cmd.estop());
+      unreal.send('/arm/status', ['estop']);
+      $('estopReason').textContent = `All motion halted (${reason}). Check the arm, then Reset.`;
+    }
+    if (s === 'normal' && reason === 'reset') {
+      // If the real arm can tell us where it is now (it may have sagged while limp),
+      // start from THERE so nothing jumps when motors re-engage.
+      if (state.twin.measured && performance.now() - state.twin.measuredAt < 500) {
+        state.q = state.twin.measured.slice();
+      }
+      state.goal = state.q.slice();
+      if (state.mode === 'ik') syncTargetToTip();
+    }
+    $('estopBanner').hidden = s !== 'estop';
+    $('estopBtn').classList.toggle('active', s === 'estop');
+    refreshLocks();
+    refreshRecorderUI();
+  },
+});
+
+/** Can a person / Unreal / playback move the arm right now? */
+const reading = () => serial.connected && state.twin.mode === 'read';
+const canDrive = () => safety.acceptsInput && !reading();
+
+function emergencyStop(reason) {
+  safety.estop(reason);
+}
+function startHoming() {
+  if (!safety.startHoming()) return;
+  stopPlayback();
+  if (state.twin.mode === 'read') setTwinMode('send');
+  serial.send(cmd.home());
+}
+
+$('estopBtn').addEventListener('click', () => emergencyStop('stop button'));
+$('resetBtn').addEventListener('click', () => {
+  serial.send(cmd.clear()); // only a human clicking here can clear an e-stop
+  safety.reset();
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') emergencyStop('Esc key');
+});
+$('homeBtn').addEventListener('click', startHoming);
+
+const speedSlider = $('speedSlider');
+speedSlider.min = SPEED_RANGE.min;
+speedSlider.max = SPEED_RANGE.max;
+speedSlider.value = SPEED_RANGE.default;
+function applySpeed() {
+  safety.maxSpeed = Number(speedSlider.value);
+  $('speedVal').textContent = `${safety.maxSpeed}°/s`;
+  speedSlider.style.setProperty('--fill', `${((safety.maxSpeed - SPEED_RANGE.min) / (SPEED_RANGE.max - SPEED_RANGE.min)) * 100}%`);
+}
+speedSlider.addEventListener('input', applySpeed);
+speedSlider.addEventListener('change', () => serial.send(cmd.speed(safety.maxSpeed)));
+applySpeed();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  5. UI: JOINT SLIDERS
  * ═══════════════════════════════════════════════════════════════════════════ */
 const sliders = JOINTS.map((j, i) => {
   const wrap = document.createElement('div');
@@ -155,10 +256,13 @@ const sliders = JOINTS.map((j, i) => {
   $('joints').appendChild(wrap);
   const input = wrap.querySelector('input');
   const [valEl, servoEl] = wrap.querySelectorAll('.joint-val b, .joint-val small');
+  const isGripper = i >= IK_JOINTS;
 
   input.addEventListener('input', () => {
+    if (!canDrive()) return;
     stopPlayback();
-    setMode('sliders');
+    // The gripper isn't part of IK, so it can be used in either mode.
+    if (!isGripper) setMode('sliders');
     state.goal[i] = Number(input.value) * DEG;
   });
   // Light up the matching joint on the 3D model while interacting.
@@ -171,11 +275,13 @@ const sliders = JOINTS.map((j, i) => {
 
   let shown = null;
   return {
+    input,
     update(rad) {
       const deg = rad / DEG;
       if (shown !== null && Math.abs(deg - shown) < 0.05) return; // skip needless DOM work
       shown = deg;
-      if (document.activeElement !== input || state.mode !== 'sliders') input.value = deg.toFixed(1);
+      const userHolding = document.activeElement === input && canDrive() && (isGripper || state.mode === 'sliders');
+      if (!userHolding) input.value = deg.toFixed(1);
       input.style.setProperty('--fill', `${((deg - j.min) / (j.max - j.min)) * 100}%`);
       valEl.textContent = `${deg.toFixed(1)}°`;
       servoEl.textContent = `servo ${(deg - j.min).toFixed(0)}°`;
@@ -183,9 +289,22 @@ const sliders = JOINTS.map((j, i) => {
   };
 });
 
+/** Grey out controls that can't be used right now (e-stop, homing, read mode). */
+function refreshLocks() {
+  const locked = !canDrive();
+  for (const s of sliders) s.input.disabled = locked;
+  for (const b of $('modeSwitch').querySelectorAll('button')) b.disabled = locked;
+  $('homeBtn').disabled = safety.estopped || safety.homing;
+  $('twinMode').querySelectorAll('button').forEach((b) => (b.disabled = !serial.connected || !safety.acceptsInput));
+  $('calBtn').disabled = !serial.connected || !state.twin.firmware?.feedback || !safety.acceptsInput || reading();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
- *  5. UI: MODE SWITCH, DRAG PLANE, HOME
+ *  6. UI: MODE SWITCH, DRAG PLANE
  * ═══════════════════════════════════════════════════════════════════════════ */
+function syncTargetToTip() {
+  target.position.copy(vec(forwardKinematics(state.q).tip));
+}
 function setMode(mode) {
   if (state.mode === mode) return;
   state.mode = mode;
@@ -193,14 +312,14 @@ function setMode(mode) {
   $('ikOptions').style.display = mode === 'ik' ? '' : 'none';
   if (mode === 'ik') {
     // Put the target where the gripper currently is, so nothing jumps.
-    target.position.copy(vec(forwardKinematics(state.q).tip));
+    syncTargetToTip();
     state.goal = state.q.slice();
     solveForTarget();
   }
 }
 $('modeSwitch').addEventListener('click', (e) => {
   const b = e.target.closest('button');
-  if (b) { stopPlayback(); setMode(b.dataset.mode); }
+  if (b && canDrive()) { stopPlayback(); setMode(b.dataset.mode); }
 });
 $('dragPlane').addEventListener('click', (e) => {
   const b = e.target.closest('button');
@@ -208,17 +327,9 @@ $('dragPlane').addEventListener('click', (e) => {
   state.dragPlane = b.dataset.plane;
   for (const x of $('dragPlane').querySelectorAll('button')) x.setAttribute('aria-pressed', String(x === b));
 });
-$('homeBtn').addEventListener('click', () => {
-  stopPlayback();
-  state.goal = HOME.slice();
-  if (state.mode === 'ik') {
-    target.position.copy(vec(forwardKinematics(HOME).tip));
-    solveForTarget();
-  }
-});
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  6. DRAGGING THE TARGET IN 3D
+ *  7. DRAGGING THE TARGET IN 3D
  * ═══════════════════════════════════════════════════════════════════════════
  *  The mouse lives on a flat 2D screen, but the target lives in 3D. To turn a
  *  2D drag into a 3D move we:
@@ -258,6 +369,7 @@ canvas.addEventListener(
   'pointerdown',
   (e) => {
     if (e.button !== 0 && e.pointerType === 'mouse') return;
+    if (!canDrive()) return; // locked: let the camera orbit instead
     setPointer(e);
     if (raycaster.intersectObject(hitSphere).length === 0) return;
     stopPlayback();
@@ -278,38 +390,187 @@ canvas.addEventListener(
 canvas.addEventListener('pointermove', (e) => {
   setPointer(e);
   if (dragging === null) {
-    canvas.style.cursor = raycaster.intersectObject(hitSphere).length ? 'grab' : '';
+    canvas.style.cursor = canDrive() && raycaster.intersectObject(hitSphere).length ? 'grab' : '';
     return;
   }
+  if (!canDrive()) return endDrag(e);
   if (e.pointerId !== dragging || !raycaster.ray.intersectPlane(dragPlane, hitPoint)) return;
   const p = hitPoint.add(grabOffset);
   if (state.dragPlane === 'height') p.set(target.position.x, p.y, target.position.z);
-  // Keep the target in a sensible box: above the floor and not miles away.
-  p.y = clamp(p.y, 0.05, 4.5);
-  const horiz = Math.hypot(p.x, p.z);
-  if (horiz > 4) p.multiply(new THREE.Vector3(4 / horiz, 1, 4 / horiz));
-  target.position.copy(p);
+  target.position.copy(clampTarget(p));
   solveForTarget();
 });
 
-const endDrag = (e) => {
+function endDrag(e) {
   if (e.pointerId !== dragging) return;
   dragging = null;
   controls.enabled = true;
   canvas.style.cursor = '';
-};
+}
 canvas.addEventListener('pointerup', endDrag);
 canvas.addEventListener('pointercancel', endDrag);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  7. RECORDER UI
+ *  8. DIGITAL TWIN — live USB link to the real arm (serial.js, protocol.js)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+const serialLogEl = $('serialLog');
+const logLines = [];
+function log(dir, text) {
+  logLines.push(`${dir} ${text}`);
+  if (logLines.length > 60) logLines.shift();
+  serialLogEl.textContent = logLines.join('\n');
+  serialLogEl.scrollTop = serialLogEl.scrollHeight;
+}
+
+const serial = createSerialLink({
+  onLine: (dir, line) => { if (!line.startsWith('P ')) log(dir, line); }, // skip the 25 Hz position spam
+  onStatus(status, detail) {
+    if (status === 'connected') {
+      $('serialStatus').textContent = 'Connected. Waiting for firmware…';
+    } else if (status === 'disconnected' || status === 'error') {
+      state.twin.firmware = null;
+      state.twin.measured = null;
+      if (state.twin.mode === 'read') setTwinMode('send');
+      $('serialStatus').textContent = status === 'error' ? `Connection error: ${detail}` : `Disconnected${detail ? ` (${detail})` : ''}.`;
+    }
+    $('serialBtn').textContent = serial.connected ? 'Disconnect' : 'Connect via USB';
+    $('serialBtn').classList.toggle('primary', !serial.connected);
+    refreshLinkDots();
+    refreshLocks();
+  },
+  onMessage(msg) {
+    const tw = state.twin;
+    switch (msg.type) {
+      case 'hello':
+        tw.firmware = msg;
+        $('serialStatus').textContent =
+          `Connected · ${msg.firmware} v${msg.version} · ${msg.joints} servos · ` +
+          (msg.feedback ? 'position feedback ✓' : 'no feedback (send only)');
+        serial.send(cmd.speed(safety.maxSpeed));
+        serial.send(tw.mode === 'read' ? cmd.read() : cmd.write());
+        if (safety.estopped) serial.send(cmd.estop()); // never let the arm forget an active e-stop
+        refreshLocks();
+        refreshLinkDots();
+        break;
+      case 'position': {
+        const servo = JOINTS.map((j, i) => msg.angles[i] ?? simToServo(state.q)[i]);
+        tw.measured = servoToSim(servo);
+        tw.measuredAt = performance.now();
+        break;
+      }
+      case 'state':
+        tw.deviceState = msg.state;
+        // The physical stop button on the arm stops the browser too.
+        if (msg.state.startsWith('ESTOP') && !safety.estopped) emergencyStop('arm button / firmware');
+        // The firmware homes itself after a reset; mirror that in the sim.
+        if (msg.state === 'HOMING' && safety.acceptsInput) safety.startHoming();
+        break;
+      case 'error':
+        if (/read mode/i.test(msg.text)) setTwinMode('send');
+        $('serialStatus').textContent = `Arm says: ${msg.text}`;
+        break;
+    }
+  },
+});
+
+if (!serialSupported()) {
+  $('serialUnsupported').hidden = false;
+  $('serialBtn').disabled = true;
+}
+
+$('serialBtn').addEventListener('click', async () => {
+  if (serial.connected) return serial.disconnect();
+  try {
+    await serial.connect();
+  } catch (err) {
+    // The user closing the device picker throws "NotFoundError": not worth shouting about.
+    $('serialStatus').textContent = err.name === 'NotFoundError' ? 'No device selected.' : err.message;
+  }
+});
+
+function setTwinMode(mode) {
+  state.twin.mode = mode;
+  for (const b of $('twinMode').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.twin === mode));
+  if (mode === 'read') {
+    stopPlayback();
+    serial.send(cmd.read());
+  } else {
+    // Hand control back to the sim from wherever the real arm was left.
+    state.goal = state.q.slice();
+    if (state.mode === 'ik') { syncTargetToTip(); solveForTarget(); }
+    serial.send(cmd.write());
+  }
+  refreshLocks();
+}
+$('twinMode').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b && !b.disabled) setTwinMode(b.dataset.twin);
+});
+$('calBtn').addEventListener('click', () => {
+  if (confirm('Auto-calibration moves every joint slowly between its limits. Clear the area around the arm. Continue?')) {
+    serial.send(cmd.calibrate());
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  9. UNREAL ENGINE — OSC via the local bridge (unreal-link.js)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+const unreal = createUnrealLink({
+  onStatus(status) {
+    const text = {
+      connecting: 'Connecting…',
+      connected: 'Connected to bridge. Waiting for Unreal…',
+      retrying: 'Bridge not reachable. Is `npm run bridge` running? Retrying…',
+      disconnected: 'Not connected.',
+      error: 'Could not connect.',
+    }[status];
+    $('oscStatus').textContent = text ?? status;
+    $('oscBtn').textContent = status === 'disconnected' ? 'Connect' : 'Disconnect';
+    refreshLinkDots();
+  },
+  onMessage({ address, args }) {
+    const nums = args.filter((a) => typeof a === 'number' && Number.isFinite(a));
+    $('oscStatus').textContent = `Receiving · last: ${address} ${nums.map((n) => n.toFixed(1)).join(' ')}`;
+    // E-stop is ALWAYS honoured. Unreal can trigger it but never clear it.
+    if (address === '/arm/estop') return emergencyStop('Unreal');
+    if (address === '/arm/home') return startHoming();
+    if (!canDrive()) return;
+    if (address === '/arm/target' && nums.length >= 3) {
+      stopPlayback();
+      setMode('ik');
+      target.position.copy(clampTarget(vec(unrealToSim(nums))));
+      solveForTarget();
+    } else if (address === '/arm/joints' && nums.length >= 3) {
+      stopPlayback();
+      setMode('sliders');
+      nums.slice(0, JOINTS.length).forEach((d, i) => (state.goal[i] = clamp(d * DEG, LIMITS[i][0], LIMITS[i][1])));
+    } else if (address === '/arm/gripper' && nums.length >= 1) {
+      state.goal[3] = clamp(nums[0], 0, 1) * LIMITS[3][1];
+    }
+  },
+});
+$('oscBtn').addEventListener('click', () => {
+  if ($('oscBtn').textContent === 'Connect') unreal.connect($('oscUrl').value.trim());
+  else unreal.disconnect();
+});
+
+function refreshLinkDots() {
+  const s = $('serialDot');
+  s.className = 'link-dot' + (state.twin.firmware ? ' on' : serial.connected ? ' busy' : '');
+  s.title = state.twin.firmware ? 'Real arm: connected' : serial.connected ? 'Real arm: waiting for firmware' : 'Real arm: not connected';
+  const o = $('oscDot');
+  o.className = 'link-dot' + (unreal.connected ? ' on' : '');
+  o.title = unreal.connected ? 'Unreal bridge: connected' : 'Unreal bridge: not connected';
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  10. RECORDER UI
  * ═══════════════════════════════════════════════════════════════════════════ */
 function stopPlayback() {
   if (recorder.state === 'playing') {
     recorder.stop();
-    if (state.mode === 'ik') {
-      target.position.copy(vec(forwardKinematics(state.q).tip));
-    }
+    state.goal = state.q.slice();
+    if (state.mode === 'ik') syncTargetToTip();
     refreshRecorderUI();
   }
 }
@@ -319,8 +580,9 @@ function refreshRecorderUI() {
   const n = recorder.frames.length;
   $('recBtn').classList.toggle('active', s === 'recording');
   $('recBtn').querySelector('.txt').textContent = s === 'recording' ? 'Stop' : 'Record';
+  $('recBtn').disabled = safety.estopped;
   $('playBtn').querySelector('.txt').textContent = s === 'playing' ? '■ Stop' : '▶ Play';
-  $('playBtn').disabled = s === 'recording' || n < 2;
+  $('playBtn').disabled = s === 'recording' || n < 2 || (s !== 'playing' && !canDrive());
   $('clearBtn').disabled = s === 'recording' || n === 0;
   $('exportPy').disabled = $('exportIno').disabled = s === 'recording' || n < 2;
   $('exportHint').textContent =
@@ -349,7 +611,7 @@ $('recBtn').addEventListener('click', () => {
 });
 $('playBtn').addEventListener('click', () => {
   if (recorder.state === 'playing') stopPlayback();
-  else recorder.play();
+  else if (canDrive()) recorder.play();
   refreshRecorderUI();
 });
 $('clearBtn').addEventListener('click', () => {
@@ -359,7 +621,7 @@ $('clearBtn').addEventListener('click', () => {
 $('loopChk').addEventListener('change', (e) => (recorder.loop = e.target.checked));
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  8. EXPORT DIALOG
+ *  11. EXPORT DIALOG
  * ═══════════════════════════════════════════════════════════════════════════ */
 const dialog = $('exportDialog');
 let exportKind = 'python';
@@ -370,7 +632,7 @@ function renderExport() {
   const frames = recorder.resample(stepMs / 1000).map(toDeg);
   exportText = exportKind === 'python' ? toPython(frames, stepMs) : toArduino(frames, stepMs);
   $('exportCode').textContent = exportText;
-  const flashBytes = frames.length * 6;
+  const flashBytes = frames.length * JOINTS.length * 2;
   $('exportStats').textContent =
     `${frames.length} frames` +
     (exportKind === 'arduino'
@@ -406,7 +668,7 @@ $('downloadBtn').addEventListener('click', () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  9. LAYOUT: resize + keep the arm visible next to/above the panel
+ *  12. LAYOUT: resize + keep the arm visible next to/above the panel
  * ═══════════════════════════════════════════════════════════════════════════ */
 const panel = $('panel');
 $('panelToggle').addEventListener('click', () => {
@@ -435,7 +697,7 @@ new ResizeObserver(resize).observe(panel);
 resize();
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  10. THE ANIMATION LOOP — runs ~60 times per second
+ *  13. THE ANIMATION LOOP — runs ~60 times per second
  * ═══════════════════════════════════════════════════════════════════════════ */
 const clock = new THREE.Clock();
 const statusEl = $('status');
@@ -446,26 +708,45 @@ const STATUS_TEXT = {
   manual: 'Manual control',
   playing: 'Playing',
   recording: '● Recording',
+  estop: 'E-STOP',
+  homing: 'Homing…',
+  reading: 'Mirroring real arm',
+  unreal: 'Driven by Unreal',
 };
+let lastOscSend = 0;
+let lastOscStatus = '';
 
 function tick() {
   const dt = Math.min(clock.getDelta(), 0.05); // seconds since last frame (capped)
   const elapsed = clock.elapsedTime;
+  const tw = state.twin;
 
-  if (recorder.state === 'playing') {
-    // Playback drives the joints directly (no smoothing, so it's exact).
-    const q = recorder.advance(dt);
-    if (q) state.q = q.slice();
+  // ── 1. Decide the goal pose (see the priority list at the top of this file) ──
+  let speed = safety.effectiveSpeed;
+  let ease = 12;
+  if (safety.estopped) {
     state.goal = state.q.slice();
+  } else if (safety.homing) {
+    state.goal = HOME.slice();
+  } else if (reading()) {
+    // Mirror the real arm. It's already moving at real speed, so allow fast following
+    // with light smoothing to hide sensor noise.
+    if (tw.measured) state.goal = tw.measured.slice();
+    speed = SPEED_RANGE.max * 2;
+    ease = 20;
+  } else if (recorder.state === 'playing') {
+    const q = recorder.advance(dt);
+    if (q) state.goal = q.slice();
     $('timelineFill').style.width = `${(recorder.time / (recorder.duration || 1)) * 100}%`;
     if (recorder.state !== 'playing') refreshRecorderUI(); // finished
-  } else {
-    // Ease towards the goal like a real servo: cover a fixed fraction of the
-    // remaining distance each frame (exponential smoothing, frame-rate independent).
-    const k = 1 - Math.exp(-dt * 12);
-    state.q = state.q.map((v, i) => clamp(v + (state.goal[i] - v) * k, LIMITS[i][0], LIMITS[i][1]));
+  }
+  if (recorder.state !== 'playing') {
     $('timelineFill').style.width = recorder.state === 'recording' ? '100%' : '0%';
   }
+
+  // ── 2. Move towards it, never faster than the speed limit ──
+  if (!safety.estopped) state.q = stepTowards(state.q, state.goal, dt, speed, ease);
+  safety.updateHoming(state.q);
 
   if (recorder.state === 'recording') {
     recorder.capture(dt, state.q);
@@ -475,20 +756,32 @@ function tick() {
   arm.setAngles(state.q);
   sliders.forEach((s, i) => s.update(state.q[i]));
 
-  // In sliders mode / playback the target simply rides on the gripper.
+  // ── 3. Digital twin: stream to the real arm / show its ghost ──
+  if (serial.connected && tw.mode === 'send' && !safety.estopped && tw.firmware && tw.deviceState !== 'HOMING') {
+    serial.sendTarget(simToServo(state.q));
+  }
+  const ghostOn = $('ghostChk').checked && tw.mode === 'send' && tw.measured && performance.now() - tw.measuredAt < 1000;
+  ghost.root.visible = !!ghostOn;
+  if (ghostOn) ghost.setAngles(tw.measured);
+
+  // ── 4. Target, status, helper lines ──
   const tip = vec(forwardKinematics(state.q).tip);
-  const following = state.mode === 'sliders' || recorder.state === 'playing';
+  const following = state.mode === 'sliders' || recorder.state === 'playing' || !canDrive();
   if (following) target.position.copy(tip);
 
-  // Status colour + gap line.
   const status =
-    recorder.state === 'recording' ? 'recording'
-      : recorder.state === 'playing' ? 'playing'
-        : state.mode === 'sliders' ? 'manual'
-          : state.ik.status;
+    safety.estopped ? 'estop'
+      : safety.homing ? 'homing'
+        : reading() ? 'reading'
+          : recorder.state === 'recording' ? 'recording'
+            : recorder.state === 'playing' ? 'playing'
+              : unreal.active() ? 'unreal'
+                : state.mode === 'sliders' ? 'manual'
+                  : state.ik.status;
   if (statusEl.dataset.status !== status) {
     statusEl.dataset.status = status;
     statusEl.textContent = STATUS_TEXT[status];
+    refreshLocks();
   }
   const ikColor = STATUS_COLORS[following ? 'ok' : state.ik.status];
   glowMat.uniforms.uColor.value.set(ikColor);
@@ -506,6 +799,18 @@ function tick() {
   floorRing.position.set(p.x, 0.003, p.z);
   $('coords').textContent = `x ${p.x.toFixed(2)} · y ${p.y.toFixed(2)} · z ${p.z.toFixed(2)}`;
 
+  // ── 5. Tell Unreal what the arm is doing (30×/s) so it can mirror it ──
+  const now = performance.now();
+  if (unreal.connected && now - lastOscSend > 33) {
+    lastOscSend = now;
+    unreal.send('/arm/state', toDeg(state.q).map((v) => Math.round(v * 10) / 10));
+    unreal.send('/arm/tip', simToUnreal(tip).map((v) => Math.round(v * 10) / 10));
+    if (status !== lastOscStatus) {
+      lastOscStatus = status;
+      unreal.send('/arm/status', [status]);
+    }
+  }
+
   controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
@@ -513,7 +818,9 @@ function tick() {
 
 solveForTarget();
 refreshRecorderUI();
+refreshLocks();
+refreshLinkDots();
 requestAnimationFrame(tick);
 
 // Handy for debugging in the browser console: try `sim.state` or `sim.ARM`.
-window.sim = { state, recorder, ARM, target, camera, solveForTarget };
+window.sim = { state, recorder, safety, ARM, target, camera, solveForTarget };

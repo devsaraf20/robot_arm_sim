@@ -2,13 +2,16 @@
  * recorder.js — records joint angles over time and plays them back.
  *
  * A recording is just a list of KEYFRAMES, like an animation timeline:
- *    [{ t: 0.00, q: [base, shoulder, elbow] }, { t: 0.033, q: [...] }, ...]
- * t is seconds since recording started, q is joint angles in radians.
+ *    [{ t: 0.00, q: [base, shoulder, elbow, gripper] }, { t: 0.033, q: [...] }, ...]
+ * t is seconds since recording started, q is joint angles in radians
+ * (base, shoulder, elbow, gripper).
  *
  * Playback finds the two keyframes around the current time and blends between
  * them (linear interpolation — "lerp"), exactly like the default interpolation
  * between keys on Blender's timeline.
  */
+import { HOME } from './ik.js';
+
 const SAMPLE_INTERVAL = 1 / 30; // record at most 30 keyframes per second
 const STORAGE_KEY = 'robot-arm-sim:recording';
 
@@ -110,7 +113,9 @@ function save(frames) {
 function loadSaved() {
   try {
     const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    return Array.isArray(data) ? data : [];
+    if (!Array.isArray(data)) return [];
+    // Recordings from the older 3-joint version have no gripper: fill in the home value.
+    return data.map((f) => ({ t: f.t, q: f.q.length < HOME.length ? [...f.q, ...HOME.slice(f.q.length)] : f.q }));
   } catch {
     return [];
   }
