@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f17" />
+    <meta name="description" content="Browser-based 3-joint robot arm simulator with inverse kinematics, path recording and Python/Arduino export." />
+    <title>Robot Arm Simulator</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <!-- The 3D view. Three.js draws into this <canvas>. -->
+    <canvas id="scene" aria-label="3D robot arm view"></canvas>
+
+    <header class="hud">
+      <h1>Robot Arm <span>Sim</span></h1>
+      <div id="status" class="pill" data-status="ok">IK solved</div>
+    </header>
+
+    <p id="hint" class="hint">Drag the glowing ball · drag empty space to orbit · scroll / pinch to zoom</p>
+
+    <!-- Control panel: a side panel on desktop, a bottom sheet on phones. -->
+    <aside id="panel" class="panel">
+      <button id="panelToggle" class="panel-handle" aria-expanded="true" aria-controls="panelBody">
+        <span class="grip"></span><span class="label">Controls</span>
+      </button>
+
+      <div id="panelBody" class="panel-body">
+        <section>
+          <h2>Mode</h2>
+          <div class="segmented" role="tablist" id="modeSwitch">
+            <button role="tab" data-mode="ik" aria-selected="true">Drag target (IK)</button>
+            <button role="tab" data-mode="sliders" aria-selected="false">Sliders (FK)</button>
+          </div>
+
+          <div id="ikOptions" class="sub">
+            <label class="small">Drag moves the target…</label>
+            <div class="segmented compact" id="dragPlane">
+              <button data-plane="view" aria-pressed="true">Free</button>
+              <button data-plane="floor" aria-pressed="false">Horizontal</button>
+              <button data-plane="height" aria-pressed="false">Height</button>
+            </div>
+            <div class="coords" id="coords">x 0.00 · y 0.00 · z 0.00</div>
+          </div>
+        </section>
+
+        <section>
+          <div class="row-between">
+            <h2>Joints</h2>
+            <button id="homeBtn" class="btn ghost small">Home</button>
+          </div>
+          <div id="joints" class="joints"><!-- sliders are created by main.js --></div>
+        </section>
+
+        <section>
+          <h2>Path recorder</h2>
+          <div class="btn-row">
+            <button id="recBtn" class="btn rec"><span class="dot"></span><span class="txt">Record</span></button>
+            <button id="playBtn" class="btn"><span class="txt">▶ Play</span></button>
+            <button id="clearBtn" class="btn ghost" title="Delete recording">Clear</button>
+          </div>
+          <div class="timeline"><div id="timelineFill"></div></div>
+          <div class="row-between small muted">
+            <span id="recInfo">No recording yet</span>
+            <label class="check"><input type="checkbox" id="loopChk" /> Loop</label>
+          </div>
+        </section>
+
+        <section>
+          <h2>Export for a real arm</h2>
+          <div class="btn-row">
+            <button id="exportPy" class="btn" disabled>Python script</button>
+            <button id="exportIno" class="btn" disabled>Arduino sketch</button>
+          </div>
+          <p class="small muted" id="exportHint">Record a motion first.</p>
+        </section>
+      </div>
+    </aside>
+
+    <!-- Export dialog (native <dialog> element: built-in modal behaviour). -->
+    <dialog id="exportDialog" class="dialog">
+      <form method="dialog" class="dialog-inner">
+        <div class="row-between">
+          <h2 id="exportTitle">Export</h2>
+          <button class="btn ghost small" value="close" aria-label="Close">✕</button>
+        </div>
+        <div class="row-between wrap">
+          <label class="small">Sample rate
+            <select id="rateSel">
+              <option value="100">10 Hz (100 ms)</option>
+              <option value="50" selected>20 Hz (50 ms)</option>
+              <option value="20">50 Hz (20 ms)</option>
+            </select>
+          </label>
+          <span class="small muted" id="exportStats"></span>
+        </div>
+        <pre class="code"><code id="exportCode"></code></pre>
+        <div class="btn-row">
+          <button type="button" id="copyBtn" class="btn">Copy</button>
+          <button type="button" id="downloadBtn" class="btn primary">Download</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
