@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f17" />
+    <meta name="description" content="Robot arm simulator and digital twin: inverse kinematics, path recording, Web Serial link to a real servo arm, Unreal Engine OSC control, Python/Arduino export." />
+    <title>Robot Arm Twin</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <!-- The 3D view. Three.js draws into this <canvas>. -->
+    <canvas id="scene" aria-label="3D robot arm view"></canvas>
+
+    <header class="hud">
+      <h1>Robot Arm <span>Twin</span></h1>
+      <div id="status" class="pill" data-status="ok">IK solved</div>
+      <div class="links" aria-label="Connections">
+        <span id="serialDot" class="link-dot" title="Real arm: not connected">ARM</span>
+        <span id="oscDot" class="link-dot" title="Unreal: not connected">UE</span>
+      </div>
+    </header>
+
+    <!-- Always visible. Escape key does the same. -->
+    <button id="estopBtn" class="estop" title="Emergency stop (Esc)" aria-label="Emergency stop">
+      <span>STOP</span>
+    </button>
+
+    <div id="estopBanner" class="estop-banner" role="alert" hidden>
+      <strong>Emergency stop</strong>
+      <span id="estopReason">All motion halted.</span>
+      <button id="resetBtn" class="btn small">Reset</button>
+    </div>
+
+    <p id="hint" class="hint">Drag the glowing ball · drag empty space to orbit · scroll / pinch to zoom · Esc = stop</p>
+
+    <!-- Control panel: a side panel on desktop, a bottom sheet on phones. -->
+    <aside id="panel" class="panel">
+      <button id="panelToggle" class="panel-handle" aria-expanded="true" aria-controls="panelBody">
+        <span class="grip"></span><span class="label">Controls</span>
+      </button>
+
+      <div id="panelBody" class="panel-body">
+        <section>
+          <h2>Mode</h2>
+          <div class="segmented" role="tablist" id="modeSwitch">
+            <button role="tab" data-mode="ik" aria-selected="true">Drag target (IK)</button>
+            <button role="tab" data-mode="sliders" aria-selected="false">Sliders (FK)</button>
+          </div>
+
+          <div id="ikOptions" class="sub">
+            <label class="small">Drag moves the target…</label>
+            <div class="segmented compact" id="dragPlane">
+              <button data-plane="view" aria-pressed="true">Free</button>
+              <button data-plane="floor" aria-pressed="false">Horizontal</button>
+              <button data-plane="height" aria-pressed="false">Height</button>
+            </div>
+            <div class="coords" id="coords">x 0.00 · y 0.00 · z 0.00</div>
+          </div>
+        </section>
+
+        <section>
+          <h2>Joints</h2>
+          <div id="joints" class="joints"><!-- sliders are created by main.js --></div>
+        </section>
+
+        <section>
+          <h2>Safety</h2>
+          <div class="joint" style="--jc: #f59e0b">
+            <div class="joint-head">
+              <span class="joint-name">Max joint speed</span>
+              <span class="joint-val"><b id="speedVal">90°/s</b></span>
+            </div>
+            <input type="range" id="speedSlider" min="10" max="360" step="5" value="90" aria-label="Maximum joint speed in degrees per second" />
+          </div>
+          <div class="btn-row" style="margin-top: 10px">
+            <button id="homeBtn" class="btn" title="Move slowly to the home pose">⌂ Run homing</button>
+          </div>
+          <p class="small muted">Joint limits are always enforced. Speed limit applies to the simulator <em>and</em> the real arm; the firmware enforces it again.</p>
+        </section>
+
+        <details class="section" id="twinSection" open>
+          <summary><h2>Digital twin · real arm</h2></summary>
+          <p id="serialUnsupported" class="small warn" hidden>
+            Web Serial needs Chrome or Edge on a desktop computer, on https or localhost.
+          </p>
+          <div class="btn-row">
+            <button id="serialBtn" class="btn primary">Connect via USB</button>
+          </div>
+          <p class="small muted" id="serialStatus">Not connected. Upload <code>firmware/robot_arm_twin</code> to your Arduino first.</p>
+          <div class="sub">
+            <label class="small">Data direction</label>
+            <div class="segmented compact" id="twinMode">
+              <button data-twin="send" aria-pressed="true">Sim → Arm</button>
+              <button data-twin="read" aria-pressed="false">Arm → Sim</button>
+            </div>
+            <div class="row-between small">
+              <label class="check"><input type="checkbox" id="ghostChk" checked /> Show real arm ghost</label>
+              <button id="calBtn" class="btn ghost small" disabled title="Auto-calibrate feedback (moves the arm!)">Calibrate</button>
+            </div>
+          </div>
+          <pre id="serialLog" class="log" aria-label="Serial console"></pre>
+        </details>
+
+        <details class="section" id="oscSection">
+          <summary><h2>Unreal Engine · OSC</h2></summary>
+          <p class="small muted">Run <code>npm run bridge</code>, then connect. Unreal sends OSC to UDP 8000 and receives arm state on 8001. See <code>unreal/UNREAL.md</code>.</p>
+          <div class="btn-row">
+            <input id="oscUrl" class="text" value="ws://localhost:8080" aria-label="Bridge WebSocket URL" spellcheck="false" />
+            <button id="oscBtn" class="btn">Connect</button>
+          </div>
+          <p class="small muted" id="oscStatus">Not connected.</p>
+        </details>
+
+        <section>
+          <h2>Path recorder</h2>
+          <div class="btn-row">
+            <button id="recBtn" class="btn rec"><span class="dot"></span><span class="txt">Record</span></button>
+            <button id="playBtn" class="btn"><span class="txt">▶ Play</span></button>
+            <button id="clearBtn" class="btn ghost" title="Delete recording">Clear</button>
+          </div>
+          <div class="timeline"><div id="timelineFill"></div></div>
+          <div class="row-between small muted">
+            <span id="recInfo">No recording yet</span>
+            <label class="check"><input type="checkbox" id="loopChk" /> Loop</label>
+          </div>
+          <p class="small muted">Tip: in <b>Arm → Sim</b> mode, move the real arm by hand and record it, then switch to <b>Sim → Arm</b> and play it back.</p>
+        </section>
+
+        <section>
+          <h2>Export for a real arm</h2>
+          <div class="btn-row">
+            <button id="exportPy" class="btn" disabled>Python script</button>
+            <button id="exportIno" class="btn" disabled>Arduino sketch</button>
+          </div>
+          <p class="small muted" id="exportHint">Record a motion first.</p>
+        </section>
+      </div>
+    </aside>
+
+    <!-- Export dialog (native <dialog> element: built-in modal behaviour). -->
+    <dialog id="exportDialog" class="dialog">
+      <form method="dialog" class="dialog-inner">
+        <div class="row-between">
+          <h2 id="exportTitle">Export</h2>
+          <button class="btn ghost small" value="close" aria-label="Close">✕</button>
+        </div>
+        <div class="row-between wrap">
+          <label class="small">Sample rate
+            <select id="rateSel">
+              <option value="100">10 Hz (100 ms)</option>
+              <option value="50" selected>20 Hz (50 ms)</option>
+              <option value="20">50 Hz (20 ms)</option>
+            </select>
+          </label>
+          <span class="small muted" id="exportStats"></span>
+        </div>
+        <pre class="code"><code id="exportCode"></code></pre>
+        <div class="btn-row">
+          <button type="button" id="copyBtn" class="btn">Copy</button>
+          <button type="button" id="downloadBtn" class="btn primary">Download</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
